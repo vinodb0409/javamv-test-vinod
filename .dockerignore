@@ -1,0 +1,7 @@
+.git
+.githu*
+.idea
+.vscode
+*.md
+target/*
+!targ*t/*.jar

@@ -1,0 +1,333 @@
+name: Java CI - SonarQube - Trivy - ECR
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+
+  push:
+    branches:
+      - main
+      - develop
+
+  workflow_dispatch:
+
+# Prevent multiple deployments from the same branch running together
+concurrency:
+  group: java-ecr-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: "17"
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+
+jobs:
+
+  # ==========================================================
+  # JOB 1: BUILD, TEST AND SONARQUBE ANALYSIS
+  # ==========================================================
+  build_and_analyze:
+    name: Build, Test and SonarQube Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      # ------------------------------------------------------
+      # Checkout source code
+      # ------------------------------------------------------
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          # SonarQube needs full Git history for accurate analysis
+          fetch-depth: 0
+
+      # ------------------------------------------------------
+      # Configure Java and Maven cache
+      # ------------------------------------------------------
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      # ------------------------------------------------------
+      # Compile application and execute tests
+      # ------------------------------------------------------
+      - name: Build and run unit tests
+        run: |
+          mvn --batch-mode clean verify
+
+      # ------------------------------------------------------
+      # Upload test results even when tests fail
+      # ------------------------------------------------------
+      - name: Upload unit-test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports-${{ github.run_id }}
+          path: |
+            **/target/surefire-reports/
+            **/target/failsafe-reports/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ------------------------------------------------------
+      # Run SonarQube analysis
+      # ------------------------------------------------------
+      - name: Run SonarQube analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+        run: |
+          mvn --batch-mode sonar:sonar \
+            -Dsonar.host.url="${SONAR_HOST_URL}" \
+            -Dsonar.token="${SONAR_TOKEN}" \
+            -Dsonar.projectKey="${{ vars.SONAR_PROJECT_KEY }}"
+
+      # ------------------------------------------------------
+      # Check SonarQube Quality Gate
+      # ------------------------------------------------------
+      - name: Check SonarQube Quality Gate
+        uses: sonarsource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+      # ------------------------------------------------------
+      # Upload compiled JAR for the Docker job
+      # ------------------------------------------------------
+      - name: Upload application JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-application-jar
+          path: target/*.jar
+          if-no-files-found: error
+          retention-days: 1
+
+  # ==========================================================
+  # JOB 2: BUILD AND SCAN DOCKER IMAGE
+  # ==========================================================
+  container_security:
+    name: Build and Scan Docker Image
+    runs-on: ubuntu-latest
+    needs:
+      - build_and_analyze
+
+    # Image will be transferred to the ECR job as a tar file
+    outputs:
+      image_tag: ${{ steps.image_metadata.outputs.image_tag }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------
+      # Download the JAR built in the previous job
+      # ------------------------------------------------------
+      - name: Download application JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: java-application-jar
+          path: target
+
+      # ------------------------------------------------------
+      # Generate the immutable image tag
+      # ------------------------------------------------------
+      - name: Generate image metadata
+        id: image_metadata
+        shell: bash
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE_TAG="${SHORT_SHA}-${GITHUB_RUN_NUMBER}"
+
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+
+          echo "Docker image tag: ${IMAGE_TAG}"
+
+      # ------------------------------------------------------
+      # Configure Docker Buildx
+      # ------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ------------------------------------------------------
+      # Build local Docker image
+      # ------------------------------------------------------
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+
+          # Load the image into the local Docker engine
+          # so that Trivy can scan it
+          load: true
+
+          tags: |
+            java-application:${{ env.IMAGE_TAG }}
+
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ------------------------------------------------------
+      # Scan Docker image with Trivy
+      # ------------------------------------------------------
+      - name: Scan Docker image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: java-application:${{ env.IMAGE_TAG }}
+          format: table
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+          # Fail the workflow if HIGH or CRITICAL
+          # vulnerabilities are detected
+          exit-code: "1"
+
+      # ------------------------------------------------------
+      # Save successfully scanned image
+      # ------------------------------------------------------
+      - name: Save scanned Docker image
+        run: |
+          docker save \
+            java-application:${IMAGE_TAG} \
+            --output java-application-image.tar
+
+      - name: Upload scanned Docker image
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanned-java-docker-image
+          path: java-application-image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  # ==========================================================
+  # JOB 3: PUSH APPROVED IMAGE TO AMAZON ECR
+  # ==========================================================
+  push_to_ecr:
+    name: Push Approved Image to Amazon ECR
+    runs-on: ubuntu-latest
+    needs:
+      - container_security
+
+    # Do not push images from pull-request validation runs
+    if: github.event_name != 'pull_request'
+
+    # Required for AWS OIDC authentication
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      # ------------------------------------------------------
+      # Download image that passed the Trivy scan
+      # ------------------------------------------------------
+      - name: Download scanned Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: scanned-java-docker-image
+          path: docker-image
+
+      # ------------------------------------------------------
+      # Load saved image into Docker
+      # ------------------------------------------------------
+      - name: Load Docker image
+        run: |
+          docker load \
+            --input docker-image/java-application-image.tar
+
+          docker image ls
+
+      # ------------------------------------------------------
+      # Authenticate to AWS through GitHub OIDC
+      # ------------------------------------------------------
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ------------------------------------------------------
+      # Verify the AWS identity
+      # ------------------------------------------------------
+      - name: Verify AWS authentication
+        run: |
+          aws sts get-caller-identity
+
+      # ------------------------------------------------------
+      # Authenticate Docker with Amazon ECR
+      # ------------------------------------------------------
+      - name: Log in to Amazon ECR
+        id: login_ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ------------------------------------------------------
+      # Tag and push the scanned image
+      # ------------------------------------------------------
+      - name: Tag and push Docker image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login_ecr.outputs.registry }}
+          IMAGE_TAG: ${{ needs.container_security.outputs.image_tag }}
+        shell: bash
+        run: |
+          SOURCE_IMAGE="java-application:${IMAGE_TAG}"
+          ECR_IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          echo "Source image: ${SOURCE_IMAGE}"
+          echo "ECR image: ${ECR_IMAGE}"
+
+          docker tag "${SOURCE_IMAGE}" "${ECR_IMAGE}"
+          docker push "${ECR_IMAGE}"
+
+          echo "IMAGE_URI=${ECR_IMAGE}" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------
+      # Add an optional branch-specific tag
+      # ------------------------------------------------------
+      - name: Add branch-specific image tag
+        env:
+          ECR_REGISTRY: ${{ steps.login_ecr.outputs.registry }}
+          IMAGE_TAG: ${{ needs.container_security.outputs.image_tag }}
+        shell: bash
+        run: |
+          SOURCE_IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            ADDITIONAL_TAG="stable"
+          else
+            ADDITIONAL_TAG="develop"
+          fi
+
+          TARGET_IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${ADDITIONAL_TAG}"
+
+          docker tag "${SOURCE_IMAGE}" "${TARGET_IMAGE}"
+          docker push "${TARGET_IMAGE}"
+
+          echo "Additional ECR tag: ${TARGET_IMAGE}"
+
+      # ------------------------------------------------------
+      # Generate workflow summary
+      # ------------------------------------------------------
+      - name: Write deployment summary
+        shell: bash
+        run: |
+          {
+            echo "## Container Image Published"
+            echo ""
+            echo "- Repository: \`${ECR_REPOSITORY}\`"
+            echo "- Image: \`${IMAGE_URI}\`"
+            echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Security scan: Passed"
+            echo "- SonarQube Quality Gate: Passed"
+          } >> "$GITHUB_STEP_SUMMARY"
